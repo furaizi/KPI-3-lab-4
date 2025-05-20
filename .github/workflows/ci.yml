@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+
+    # За потреби паралельних збірок можна лімітувати:
+    # concurrency:
+    #   group: ${{ github.workflow }}-${{ github.ref }}
+    #   cancel-in-progress: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Enable BuildKit
+        run: echo "DOCKER_BUILDKIT=1" >> $GITHUB_ENV
+
+      - name: Compose build & integration tests
+        run: |
+          docker compose \
+            -f docker-compose.yaml \
+            -f docker-compose.test.yaml \
+            up --build --abort-on-container-exit --exit-code-from test
+
+      - name: Tear down Compose stack
+        if: always()
+        run: docker compose -f docker-compose.yaml -f docker-compose.test.yaml down -v --remove-orphans
