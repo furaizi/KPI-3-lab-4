@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/roman-mazur/architecture-practice-4-template/httptools"
@@ -14,20 +15,30 @@ import (
 )
 
 var (
-	port       = flag.Int("port", 8090, "load balancer port")
-	timeoutSec = flag.Int("timeout-sec", 3, "request timeout time in seconds")
-	https      = flag.Bool("https", false, "whether backends support HTTPs")
-
+	port        = flag.Int("port", 8090, "load balancer port")
+	timeoutSec  = flag.Int("timeout-sec", 3, "request timeout time in seconds")
+	https       = flag.Bool("https", false, "whether backends support HTTPs")
 	traceEnabled = flag.Bool("trace", false, "whether to include tracing information into responses")
 )
 
 var (
-	timeout     = time.Duration(*timeoutSec) * time.Second
+	timeout     time.Duration
 	serversPool = []string{
 		"server1:8080",
 		"server2:8080",
 		"server3:8080",
 	}
+)
+
+type BackendServer struct {
+	Address string
+	Traffic int64
+	Healthy bool
+}
+
+var (
+	backendStats = make(map[string]*BackendServer)
+	mu           sync.Mutex
 )
 
 func scheme() string {
@@ -38,21 +49,24 @@ func scheme() string {
 }
 
 func health(dst string) bool {
-	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("%s://%s/health", scheme(), dst), nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false
 	}
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	return true
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
 }
 
 func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
-	ctx, _ := context.WithTimeout(r.Context(), timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
 	fwdRequest := r.Clone(ctx)
 	fwdRequest.RequestURI = ""
 	fwdRequest.URL.Host = dst
@@ -61,6 +75,7 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 
 	resp, err := http.DefaultClient.Do(fwdRequest)
 	if err == nil {
+		defer resp.Body.Close()
 		for k, values := range resp.Header {
 			for _, value := range values {
 				rw.Header().Add(k, value)
@@ -71,7 +86,6 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 		}
 		log.Println("fwd", resp.StatusCode, resp.Request.URL)
 		rw.WriteHeader(resp.StatusCode)
-		defer resp.Body.Close()
 		_, err := io.Copy(rw, resp.Body)
 		if err != nil {
 			log.Printf("Failed to write response: %s", err)
@@ -84,22 +98,59 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
+func getLeastTrafficServer() *BackendServer {
+	mu.Lock()
+	defer mu.Unlock()
+
+	var selected *BackendServer
+	for _, server := range backendStats {
+		if server.Healthy {
+			if selected == nil || server.Traffic < selected.Traffic {
+				selected = server
+			}
+		}
+	}
+	return selected
+}
+
 func main() {
 	flag.Parse()
+	timeout = time.Duration(*timeoutSec) * time.Second
 
-	// TODO: Використовуйте дані про стан сервера, щоб підтримувати список тих серверів, яким можна відправляти запит.
-	for _, server := range serversPool {
-		server := server
+	for _, addr := range serversPool {
+		backendStats[addr] = &BackendServer{
+			Address: addr,
+			Traffic: 0,
+			Healthy: false,
+		}
+	}
+
+	for _, addr := range serversPool {
+		addr := addr
 		go func() {
-			for range time.Tick(10 * time.Second) {
-				log.Println(server, "healthy:", health(server))
+			for range time.Tick(5 * time.Second) {
+				isHealthy := health(addr)
+				mu.Lock()
+				backendStats[addr].Healthy = isHealthy
+				mu.Unlock()
+				log.Println(addr, "healthy:", isHealthy)
 			}
 		}()
 	}
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Реалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		server := getLeastTrafficServer()
+		if server == nil {
+			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+			return
+		}
+
+		err := forward(server.Address, rw, r)
+		if err == nil {
+			mu.Lock()
+			server.Traffic++
+			mu.Unlock()
+		}
 	}))
 
 	log.Println("Starting load balancer...")
