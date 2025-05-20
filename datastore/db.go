@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const outFileName = "current-data"
@@ -15,11 +16,21 @@ var ErrNotFound = fmt.Errorf("record does not exist")
 
 type hashIndex map[string]int64
 
+type writeRequest struct {
+	key   string
+	value string
+	done  chan error
+}
+
 type Db struct {
 	out       *os.File
 	outOffset int64
 
-	index hashIndex
+	index   hashIndex
+	indexMu sync.RWMutex
+
+	writeCh chan writeRequest
+	wg      sync.WaitGroup
 }
 
 func Open(dir string) (*Db, error) {
@@ -28,15 +39,39 @@ func Open(dir string) (*Db, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	db := &Db{
-		out:   f,
-		index: make(hashIndex),
+		out:     f,
+		index:   make(hashIndex),
+		writeCh: make(chan writeRequest, 128), // буферизований канал
 	}
-	err = db.recover()
-	if err != nil && err != io.EOF {
+
+	// Відновлюємо індекс
+	if err := db.recover(); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
+
+	db.wg.Add(1)
+	go db.backgroundWriter()
+
 	return db, nil
+}
+
+func (db *Db) backgroundWriter() {
+	defer db.wg.Done()
+	for req := range db.writeCh {
+		e := entry{key: req.key, value: req.value}
+		data := e.Encode()
+
+		n, err := db.out.Write(data)
+		if err == nil {
+			db.indexMu.Lock()
+			db.index[req.key] = db.outOffset
+			db.outOffset += int64(n)
+			db.indexMu.Unlock()
+		}
+		req.done <- err
+	}
 }
 
 func (db *Db) recover() error {
@@ -67,11 +102,25 @@ func (db *Db) recover() error {
 }
 
 func (db *Db) Close() error {
+	close(db.writeCh)
+	db.wg.Wait()
 	return db.out.Close()
 }
 
+func (db *Db) Put(key, value string) error {
+	done := make(chan error, 1)
+	db.writeCh <- writeRequest{
+		key:   key,
+		value: value,
+		done:  done,
+	}
+	return <-done
+}
+
 func (db *Db) Get(key string) (string, error) {
+	db.indexMu.RLock()
 	position, ok := db.index[key]
+	db.indexMu.RUnlock()
 	if !ok {
 		return "", ErrNotFound
 	}
@@ -92,19 +141,6 @@ func (db *Db) Get(key string) (string, error) {
 		return "", err
 	}
 	return record.value, nil
-}
-
-func (db *Db) Put(key, value string) error {
-	e := entry{
-		key:   key,
-		value: value,
-	}
-	n, err := db.out.Write(e.Encode())
-	if err == nil {
-		db.index[key] = db.outOffset
-		db.outOffset += int64(n)
-	}
-	return err
 }
 
 func (db *Db) Size() (int64, error) {
