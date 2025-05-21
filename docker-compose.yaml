@@ -2,7 +2,6 @@ networks:
   servers:
 
 services:
-
   balancer:
     build: .
     command: "lb"
@@ -31,3 +30,13 @@ services:
       - servers
     ports:
       - "8082:8080"
+
+  db:
+    build: .
+    command: "db"
+    networks:
+      - servers
+    ports:
+      - "8070:8070"
+    volumes:
+      - ./db_data:/opt/practice-4/db_data
