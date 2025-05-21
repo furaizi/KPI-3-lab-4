@@ -11,6 +11,18 @@ import (
 )
 
 const outFileName = "current-data"
+const getWorkerCount = 10
+
+
+type getRequest struct {
+	key      string
+	response chan getResult
+}
+
+type getResult struct {
+	value string
+	err   error
+}
 
 var ErrNotFound = fmt.Errorf("record does not exist")
 
@@ -31,6 +43,9 @@ type Db struct {
 
 	writeCh chan writeRequest
 	wg      sync.WaitGroup
+
+	getCh  chan getRequest
+	getWg  sync.WaitGroup
 }
 
 func Open(dir string) (*Db, error) {
@@ -44,6 +59,7 @@ func Open(dir string) (*Db, error) {
 		out:     f,
 		index:   make(hashIndex),
 		writeCh: make(chan writeRequest, 128), // буферизований канал
+		getCh:   make(chan getRequest, 128),
 	}
 
 	// Відновлюємо індекс
@@ -53,6 +69,12 @@ func Open(dir string) (*Db, error) {
 
 	db.wg.Add(1)
 	go db.backgroundWriter()
+
+    // Додавання воркерів
+    for i := 0; i < getWorkerCount; i++ {
+		db.getWg.Add(1)
+		go db.backgroundReader()
+	}
 
 	return db, nil
 }
@@ -71,6 +93,43 @@ func (db *Db) backgroundWriter() {
 			db.indexMu.Unlock()
 		}
 		req.done <- err
+	}
+}
+func (db *Db) backgroundReader() {
+	defer db.getWg.Done()
+	for req := range db.getCh {
+		// читаємо запис для ключа
+		db.indexMu.RLock()
+		position, ok := db.index[req.key]
+		db.indexMu.RUnlock()
+		if !ok {
+			req.response <- getResult{"", ErrNotFound}
+			continue
+		}
+
+		file, err := os.Open(db.out.Name())
+		if err != nil {
+			req.response <- getResult{"", err}
+			continue
+		}
+		// закриваємо файл після читання
+		func() {
+			defer file.Close()
+
+			_, err = file.Seek(position, 0)
+			if err != nil {
+				req.response <- getResult{"", err}
+				return
+			}
+
+			var record entry
+			if _, err = record.DecodeFromReader(bufio.NewReader(file)); err != nil {
+				req.response <- getResult{"", err}
+				return
+			}
+
+			req.response <- getResult{record.value, nil}
+		}()
 	}
 }
 
@@ -104,6 +163,10 @@ func (db *Db) recover() error {
 func (db *Db) Close() error {
 	close(db.writeCh)
 	db.wg.Wait()
+
+	close(db.getCh)
+	db.getWg.Wait()
+
 	return db.out.Close()
 }
 
@@ -117,30 +180,12 @@ func (db *Db) Put(key, value string) error {
 	return <-done
 }
 
+// Get відправляє запит на отримання значення для ключа
 func (db *Db) Get(key string) (string, error) {
-	db.indexMu.RLock()
-	position, ok := db.index[key]
-	db.indexMu.RUnlock()
-	if !ok {
-		return "", ErrNotFound
-	}
-
-	file, err := os.Open(db.out.Name())
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	_, err = file.Seek(position, 0)
-	if err != nil {
-		return "", err
-	}
-
-	var record entry
-	if _, err = record.DecodeFromReader(bufio.NewReader(file)); err != nil {
-		return "", err
-	}
-	return record.value, nil
+	respCh := make(chan getResult, 1)
+	db.getCh <- getRequest{key: key, response: respCh}
+	res := <-respCh
+	return res.value, res.err
 }
 
 func (db *Db) Size() (int64, error) {
